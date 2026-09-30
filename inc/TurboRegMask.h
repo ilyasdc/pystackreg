@@ -61,6 +61,8 @@ class TurboRegMask {
 public:
   TurboRegMask(TurboRegImage &img);
   TurboRegMask(matrix<double> &imp, int width, int height);
+  /* maskData may be nullptr: mask is then filled with ones (unmasked). */
+  TurboRegMask(double *maskData, int width, int height);
 
   void clearMask();
   std::vector<double> &getMask();

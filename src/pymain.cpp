@@ -66,20 +66,18 @@ PyMODINIT_FUNC initturboreg(void) {
 
 #endif
 
-bool registerImg(double *pDataRef, double *pDataMov,
-                 Transformation transformation, int width, int height,
-                 regMat &rm) {
+bool registerImg(double *pDataRef, double *pDataMov, double *pDataRefMask,
+                 double *pDataMovMask, Transformation transformation, int width,
+                 int height, regMat &rm) {
   TurboRegImage refImg(pDataRef, width, height, transformation, true);
   TurboRegImage movImg(pDataMov, width, height, transformation, false);
 
   TurboRegPointHandler refPH(refImg, transformation);
   TurboRegPointHandler movPH(movImg, transformation);
 
-  TurboRegMask refMsk(refImg);
-  TurboRegMask movMsk(movImg);
-
-  refMsk.clearMask();
-  movMsk.clearMask();
+  /* nullptr mask data => all-ones (fully unmasked), matching legacy clearMask(). */
+  TurboRegMask refMsk(pDataRefMask, width, height);
+  TurboRegMask movMsk(pDataMovMask, width, height);
 
   int pyramidDepth = getPyramidDepth(movImg.getWidth(), movImg.getHeight(),
                                      refImg.getWidth(), refImg.getHeight());
@@ -132,12 +130,13 @@ std::vector<double> transformImg(matrix<double> m, double *pDataMov, int width,
 }
 
 PyObject *turbogreg_register(PyObject *self, PyObject *args) {
-  PyObject *ref, *mov;
+  PyObject *ref, *mov, *ref_mask, *mov_mask;
   regMat rm;
   unsigned char tf;
 
-  /* Parse the input tuple */
-  if (!PyArg_ParseTuple(args, "OOB", &ref, &mov, &tf)) {
+  /* Parse the input tuple: ref, mov, ref_mask, mov_mask, transformation.
+   * Masks may be None (optional → fully unmasked). */
+  if (!PyArg_ParseTuple(args, "OOOOB", &ref, &mov, &ref_mask, &mov_mask, &tf)) {
     return NULL;
   }
 
@@ -150,21 +149,39 @@ PyObject *turbogreg_register(PyObject *self, PyObject *args) {
   /* Interpret the input objects as numpy arrays. */
   PyObject *po_ref_array = PyArray_FROM_OTF(ref, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
   PyObject *po_mov_array = PyArray_FROM_OTF(mov, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+  PyObject *po_ref_mask_array = NULL;
+  PyObject *po_mov_mask_array = NULL;
 
-  if (!PyArray_Check(po_ref_array) || !PyArray_Check(po_mov_array)) {
-    PyErr_SetString(PyExc_TypeError, "Expected a numpy array");
+  if (po_ref_array == NULL || po_mov_array == NULL) {
+    Py_XDECREF(po_ref_array);
+    Py_XDECREF(po_mov_array);
     return NULL;
+  }
+
+  if (ref_mask != Py_None) {
+    po_ref_mask_array =
+        PyArray_FROM_OTF(ref_mask, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (po_ref_mask_array == NULL) {
+      Py_XDECREF(po_ref_array);
+      Py_XDECREF(po_mov_array);
+      return NULL;
+    }
+  }
+  if (mov_mask != Py_None) {
+    po_mov_mask_array =
+        PyArray_FROM_OTF(mov_mask, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (po_mov_mask_array == NULL) {
+      Py_XDECREF(po_ref_array);
+      Py_XDECREF(po_mov_array);
+      Py_XDECREF(po_ref_mask_array);
+      return NULL;
+    }
   }
 
   PyArrayObject *ref_array = (PyArrayObject *)po_ref_array;
   PyArrayObject *mov_array = (PyArrayObject *)po_mov_array;
-
-  /* If that didn't work, throw an exception. */
-  if (ref_array == NULL || mov_array == NULL) {
-    Py_XDECREF(ref_array);
-    Py_XDECREF(mov_array);
-    return NULL;
-  }
+  PyArrayObject *ref_mask_array = (PyArrayObject *)po_ref_mask_array;
+  PyArrayObject *mov_mask_array = (PyArrayObject *)po_mov_mask_array;
 
   int ndim_ref = (int)PyArray_NDIM(ref_array);
   int ndim_mov = (int)PyArray_NDIM(mov_array);
@@ -172,7 +189,19 @@ PyObject *turbogreg_register(PyObject *self, PyObject *args) {
   if (ndim_ref != 2 || ndim_mov != 2) {
     Py_XDECREF(ref_array);
     Py_XDECREF(mov_array);
+    Py_XDECREF(ref_mask_array);
+    Py_XDECREF(mov_mask_array);
     PyErr_SetString(PyExc_ValueError, "Input arrays must be two dimensional");
+    return NULL;
+  }
+
+  if ((ref_mask_array != NULL && (int)PyArray_NDIM(ref_mask_array) != 2) ||
+      (mov_mask_array != NULL && (int)PyArray_NDIM(mov_mask_array) != 2)) {
+    Py_XDECREF(ref_array);
+    Py_XDECREF(mov_array);
+    Py_XDECREF(ref_mask_array);
+    Py_XDECREF(mov_mask_array);
+    PyErr_SetString(PyExc_ValueError, "Mask arrays must be two dimensional");
     return NULL;
   }
 
@@ -185,20 +214,56 @@ PyObject *turbogreg_register(PyObject *self, PyObject *args) {
   if (Nx_ref != Nx_mov || Ny_ref != Ny_mov) {
     Py_XDECREF(ref_array);
     Py_XDECREF(mov_array);
+    Py_XDECREF(ref_mask_array);
+    Py_XDECREF(mov_mask_array);
     PyErr_SetString(PyExc_ValueError, "Input arrays must of the same shape");
     return NULL;
+  }
+
+  if (ref_mask_array != NULL) {
+    int Nx_ref_mask = (int)PyArray_DIM(ref_mask_array, 0);
+    int Ny_ref_mask = (int)PyArray_DIM(ref_mask_array, 1);
+    if (Nx_ref_mask != Nx_ref || Ny_ref_mask != Ny_ref) {
+      Py_XDECREF(ref_array);
+      Py_XDECREF(mov_array);
+      Py_XDECREF(ref_mask_array);
+      Py_XDECREF(mov_mask_array);
+      PyErr_SetString(PyExc_ValueError,
+                      "Reference mask must have the same shape as images");
+      return NULL;
+    }
+  }
+  if (mov_mask_array != NULL) {
+    int Nx_mov_mask = (int)PyArray_DIM(mov_mask_array, 0);
+    int Ny_mov_mask = (int)PyArray_DIM(mov_mask_array, 1);
+    if (Nx_mov_mask != Nx_ref || Ny_mov_mask != Ny_ref) {
+      Py_XDECREF(ref_array);
+      Py_XDECREF(mov_array);
+      Py_XDECREF(ref_mask_array);
+      Py_XDECREF(mov_mask_array);
+      PyErr_SetString(PyExc_ValueError,
+                      "Moving mask must have the same shape as images");
+      return NULL;
+    }
   }
 
   /* Get pointers to the data as C-types. */
   double *img_ref = (double *)PyArray_DATA(ref_array);
   double *img_mov = (double *)PyArray_DATA(mov_array);
+  double *img_ref_mask =
+      ref_mask_array ? (double *)PyArray_DATA(ref_mask_array) : nullptr;
+  double *img_mov_mask =
+      mov_mask_array ? (double *)PyArray_DATA(mov_mask_array) : nullptr;
 
-  registerImg(img_ref, img_mov, (Transformation)tf, Ny_ref, Nx_ref,
+  registerImg(img_ref, img_mov, img_ref_mask, img_mov_mask, (Transformation)tf,
+              Ny_ref, Nx_ref,
               rm); // width and height (Nx/Ny) have to be swapped!
 
   /* clean up */
   Py_XDECREF(ref_array);
   Py_XDECREF(mov_array);
+  Py_XDECREF(ref_mask_array);
+  Py_XDECREF(mov_mask_array);
 
   npy_intp dims_mat[2];
   npy_intp dims_pts[2];
@@ -208,9 +273,12 @@ PyObject *turbogreg_register(PyObject *self, PyObject *args) {
   dims_pts[0] = rm.refPts.nrows();
   dims_pts[1] = rm.refPts.ncols();
 
-  PyArrayObject *retMat = (PyArrayObject*)PyArray_SimpleNew(2, (npy_intp *)&dims_mat, NPY_DOUBLE);
-  PyArrayObject *retPtsRef = (PyArrayObject*)PyArray_SimpleNew(2, (npy_intp *)&dims_pts, NPY_DOUBLE);
-  PyArrayObject *retPtsMov = (PyArrayObject*)PyArray_SimpleNew(2, (npy_intp *)&dims_pts, NPY_DOUBLE);
+  PyArrayObject *retMat =
+      (PyArrayObject *)PyArray_SimpleNew(2, (npy_intp *)&dims_mat, NPY_DOUBLE);
+  PyArrayObject *retPtsRef =
+      (PyArrayObject *)PyArray_SimpleNew(2, (npy_intp *)&dims_pts, NPY_DOUBLE);
+  PyArrayObject *retPtsMov =
+      (PyArrayObject *)PyArray_SimpleNew(2, (npy_intp *)&dims_pts, NPY_DOUBLE);
 
   memcpy((void *)PyArray_DATA(retMat), rm.mat.begin(),
          (dims_mat[0] * dims_mat[1] * sizeof(double)));

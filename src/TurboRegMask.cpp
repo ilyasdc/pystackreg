@@ -127,6 +127,24 @@ TurboRegMask::TurboRegMask(matrix<double> &imp, int width, int height) {
 
 } /* end turboRegMask */
 
+TurboRegMask::TurboRegMask(double *maskData, int width, int height) {
+  this->width = width;
+  this->height = height;
+  this->mask.resize(width * height);
+
+  if (maskData == nullptr) {
+    this->clearMask();
+    return;
+  }
+
+  int k = 0;
+  for (int y = 0; (y < height); y++) {
+    for (int x = 0; (x < width); x++, k++) {
+      mask[k] = maskData[k];
+    }
+  }
+} /* end turboRegMask */
+
 /*....................................................................
 methods
 ....................................................................*/

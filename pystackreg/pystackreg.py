@@ -72,7 +72,7 @@ class StackReg:
         """
         return self._is_registered
 
-    def register(self, ref, mov):
+    def register(self, ref, mov, ref_mask=None, mov_mask=None):
         """
         Registers an image to a reference image: Only the transformation matrix
         will be calculated, the image will not be transformed
@@ -85,16 +85,53 @@ class StackReg:
         :param mov:
             The image that should be aligned to the reference image
 
+        :type ref_mask: array_like (Ni..., Nj...), optional
+        :param ref_mask:
+            Optional mask for the reference image. Non-zero/positive values are
+            included. If None, the full image is used (legacy behaviour).
+
+        :type mov_mask: array_like (Ni..., Nj...), optional
+        :param mov_mask:
+            Optional mask for the moving image. Non-zero/positive values are
+            included. If None, the full image is used (legacy behaviour).
+
         :rtype:  ndarray(3,3)
         :return: 2D transformation matrix
         """
         self._is_registered = True
 
+        ref = np.asarray(ref, dtype=np.double)
+        mov = np.asarray(mov, dtype=np.double)
+        if ref.shape != mov.shape:
+            raise ValueError(
+                "Reference and moving images must have the same shape, got "
+                "{} and {}".format(ref.shape, mov.shape)
+            )
+
+        ref_mask = self._validate_mask(ref_mask, ref.shape, "ref_mask")
+        mov_mask = self._validate_mask(mov_mask, mov.shape, "mov_mask")
+
+        # TurboReg crops the last row/column; keep masks aligned with that crop.
         self._m, self._refpts, self._movpts = turboreg._register(
-            ref[:-1, :-1], mov[:-1, :-1], self._transformation
+            ref[:-1, :-1],
+            mov[:-1, :-1],
+            None if ref_mask is None else ref_mask[:-1, :-1],
+            None if mov_mask is None else mov_mask[:-1, :-1],
+            self._transformation,
         )
 
         return self.get_matrix()
+
+    @staticmethod
+    def _validate_mask(mask, shape, name):
+        if mask is None:
+            return None
+        mask = np.asarray(mask, dtype=np.double)
+        if mask.shape != shape:
+            raise ValueError(
+                "{} must have shape {}, got {}".format(name, shape, mask.shape)
+            )
+        return mask
 
     def transform(self, mov, tmat=None):
         """
@@ -123,7 +160,7 @@ class StackReg:
 
         return turboreg._transform(mov, tmat)
 
-    def register_transform(self, ref, mov):
+    def register_transform(self, ref, mov, ref_mask=None, mov_mask=None):
         """
         Register and transform an image to a reference image.
 
@@ -133,11 +170,17 @@ class StackReg:
         :type mov: array_like (Ni..., Nj...)
         :param mov: The image that should be aligned to the reference image
 
+        :type ref_mask: array_like (Ni..., Nj...), optional
+        :param ref_mask: Optional mask for the reference image
+
+        :type mov_mask: array_like (Ni..., Nj...), optional
+        :param mov_mask: Optional mask for the moving image
+
         :rtype:  ndarray (Ni..., Nj...)
         :return: Transformed image - will be of the same shape as the input image
                  (cropping may occur)
         """
-        self.register(ref, mov)
+        self.register(ref, mov, ref_mask=ref_mask, mov_mask=mov_mask)
         return self.transform(mov)
 
     def get_matrix(self):
@@ -258,6 +301,7 @@ class StackReg:
         verbose=False,
         progress_callback=None,
         suppress_axis_warning=False,
+        mask=None,
     ):
         """
         Register a stack of images (movie).
@@ -307,6 +351,17 @@ class StackReg:
             warning when the detected time axis is not equal to the supplied axis.
             Set this option to True to suppress this warning.
 
+        :type mask: array_like, optional
+        :param mask:
+            Optional registration mask. May be:
+
+            * ``None``: no masking (legacy behaviour)
+            * 2D array matching a single frame: same mask for every frame
+            * 3D array matching ``img``: per-frame masks. For
+              ``reference='previous'``, frame ``i-1`` masks the reference and
+              frame ``i`` masks the moving image. For ``'first'`` / ``'mean'``,
+              the reference mask is the mean of the corresponding frames.
+
         :rtype:  ndarray(img.shape[axis], 3, 3)
         :return: The transformation matrix for each image in the stack
         """
@@ -347,13 +402,51 @@ class StackReg:
             np.identity(tmatdim).reshape((1, tmatdim, tmatdim)), img.shape[axis], axis=0
         ).astype(np.double)
 
+        mask_stack = None
+        static_mask = None
+        if mask is not None:
+            mask = np.asarray(mask, dtype=np.double)
+            if mask.ndim == 2:
+                frame_shape = tuple(
+                    s for ax, s in enumerate(img.shape) if ax != axis
+                )
+                if mask.shape != frame_shape:
+                    raise ValueError(
+                        "2D mask must match frame shape {}, got {}".format(
+                            frame_shape, mask.shape
+                        )
+                    )
+                static_mask = mask
+            elif mask.ndim == 3:
+                if mask.shape != img.shape:
+                    raise ValueError(
+                        "3D mask must match image stack shape {}, got {}".format(
+                            img.shape, mask.shape
+                        )
+                    )
+                mask_stack = mask
+            else:
+                raise ValueError(
+                    "mask must be None, a 2D frame mask, or a 3D stack mask"
+                )
+
         if reference == "first":
             ref = np.mean(img.take(range(n_frames), axis=axis), axis=axis)
+            if mask_stack is not None:
+                ref_mask = np.mean(
+                    mask_stack.take(range(n_frames), axis=axis), axis=axis
+                )
+            else:
+                ref_mask = static_mask
         elif reference == "mean":
             ref = img.mean(axis=axis)
             idx_start = 0
+            if mask_stack is not None:
+                ref_mask = mask_stack.mean(axis=axis)
+            else:
+                ref_mask = static_mask
         elif reference == "previous":
-            pass
+            ref_mask = None
         else:
             raise ValueError('Unknown reference "{}"'.format(reference))
 
@@ -368,8 +461,22 @@ class StackReg:
 
             if reference == "previous":
                 ref = img.take(i - 1, axis=axis)
+                if mask_stack is not None:
+                    ref_mask = simple_slice(mask_stack, i - 1, axis)
+                else:
+                    ref_mask = static_mask
 
-            self._tmats[i, :, :] = self.register(ref, simple_slice(img, i, axis))
+            if mask_stack is not None:
+                mov_mask = simple_slice(mask_stack, i, axis)
+            else:
+                mov_mask = static_mask
+
+            self._tmats[i, :, :] = self.register(
+                ref,
+                simple_slice(img, i, axis),
+                ref_mask=ref_mask,
+                mov_mask=mov_mask,
+            )
 
             if reference == "previous" and i > 0:
                 self._tmats[i, :, :] = np.matmul(
@@ -431,6 +538,7 @@ class StackReg:
         moving_average=1,
         verbose=False,
         progress_callback=None,
+        mask=None,
     ):
         """
         Register and transform stack of images (movie).
@@ -470,11 +578,21 @@ class StackReg:
             A function that is called after every iteration. This function should accept
             the keyword arguments current_iteration:int and end_iteration:int.
 
+        :type mask: array_like, optional
+        :param mask: Optional 2D or 3D registration mask (see register_stack)
+
         :rtype:  ndarray(Ni..., Nj..., Nk...)
         :return: The transformed stack
         """
         self.register_stack(
-            img, reference, n_frames, axis, moving_average, verbose, progress_callback
+            img,
+            reference=reference,
+            n_frames=n_frames,
+            axis=axis,
+            moving_average=moving_average,
+            verbose=verbose,
+            progress_callback=progress_callback,
+            mask=mask,
         )
 
         return self.transform_stack(img, axis)

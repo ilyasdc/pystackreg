@@ -106,6 +106,56 @@ def test_registration_transformation(stack, stack_unregistered):
     )
 
 
+def test_optional_mask_none_matches_unmasked(stack_unregistered):
+    """Omitting masks must match legacy (fully unmasked) registration."""
+    sr = StackReg(StackReg.TRANSLATION)
+    tmats_a = sr.register_stack(stack_unregistered, reference="previous")
+    tmats_b = sr.register_stack(stack_unregistered, reference="previous", mask=None)
+    np.testing.assert_allclose(tmats_a, tmats_b)
+
+    ones = np.ones(stack_unregistered.shape[1:], dtype=np.float64)
+    tmats_c = sr.register_stack(stack_unregistered, reference="previous", mask=ones)
+    np.testing.assert_allclose(tmats_a, tmats_c, rtol=1e-10, atol=1e-10)
+
+
+def test_register_with_pair_masks(stack_unregistered):
+    ref = stack_unregistered[0]
+    mov = stack_unregistered[1]
+    sr = StackReg(StackReg.TRANSLATION)
+
+    m_none = sr.register(ref, mov)
+    m_ones = sr.register(
+        ref, mov, ref_mask=np.ones_like(ref), mov_mask=np.ones_like(mov)
+    )
+    np.testing.assert_allclose(m_none, m_ones, rtol=1e-10, atol=1e-10)
+
+    # Zeroing out a corner should still produce a finite transform.
+    mask = np.ones_like(ref)
+    mask[:20, :20] = 0
+    m_masked = sr.register(ref, mov, ref_mask=mask, mov_mask=mask)
+    assert m_masked.shape == (3, 3)
+    assert np.all(np.isfinite(m_masked))
+
+
+def test_stack_mask_shapes(stack_unregistered):
+    sr = StackReg(StackReg.TRANSLATION)
+    frame_mask = np.ones(stack_unregistered.shape[1:], dtype=np.float64)
+    stack_mask = np.ones_like(stack_unregistered, dtype=np.float64)
+
+    tmats_2d = sr.register_stack(
+        stack_unregistered, reference="first", mask=frame_mask
+    )
+    tmats_3d = sr.register_stack(
+        stack_unregistered, reference="first", mask=stack_mask
+    )
+    np.testing.assert_allclose(tmats_2d, tmats_3d, rtol=1e-10, atol=1e-10)
+
+    with pytest.raises(ValueError):
+        sr.register_stack(
+            stack_unregistered, reference="first", mask=np.ones((3, 3))
+        )
+
+
 @pytest.mark.parametrize("frame_axis", [1, 2])
 def test_different_axis(stack, stack_unregistered, frame_axis):
     stack["registered"] = np.moveaxis(stack["registered"], 0, frame_axis)
