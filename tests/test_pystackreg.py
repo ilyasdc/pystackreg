@@ -137,6 +137,38 @@ def test_register_with_pair_masks(stack_unregistered):
     assert np.all(np.isfinite(m_masked))
 
 
+def test_masked_oob_border_recovers_translation(stack_unregistered):
+    """
+    ImageJ TurboReg: data outside the frame is irrelevant. Zero-padded OOB
+    borders marked via masks must not poison TRANSLATION (crop-to-mask-frame).
+    """
+    from skimage.transform import AffineTransform, warp
+
+    ref = stack_unregistered[0].astype(np.float64)
+    dy, dx = 12, -18
+    mov = warp(
+        ref,
+        AffineTransform(translation=(dx, dy)).inverse,
+        order=1,
+        cval=0.0,
+        preserve_range=True,
+    ).astype(np.float64)
+
+    # Extra OOB crop (zeros) — intensity alone would create a fake edge.
+    mov[0:25, :] = 0
+    mov[:, 0:40] = 0
+    mov_mask = (mov != 0).astype(np.float64)
+    ref_mask = np.ones_like(ref, dtype=np.float64)
+
+    sr = StackReg(StackReg.TRANSLATION)
+    t_masked = sr.register(ref, mov, ref_mask=ref_mask, mov_mask=mov_mask)
+    np.testing.assert_allclose(t_masked[0, 2], dx, atol=0.05)
+    np.testing.assert_allclose(t_masked[1, 2], dy, atol=0.05)
+
+    # Same crop without masks must not be required to recover GT; just check
+    # the masked path is the one that matches the known shift above.
+
+
 def test_stack_mask_shapes(stack_unregistered):
     sr = StackReg(StackReg.TRANSLATION)
     frame_mask = np.ones(stack_unregistered.shape[1:], dtype=np.float64)

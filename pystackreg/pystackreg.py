@@ -87,13 +87,25 @@ class StackReg:
 
         :type ref_mask: array_like (Ni..., Nj...), optional
         :param ref_mask:
-            Optional mask for the reference image. Non-zero/positive values are
-            included. If None, the full image is used (legacy behaviour).
+            Optional mask for the reference image (TurboReg stack slice 2).
+            Non-zero values are included. If None, the full frame is used
+            (``clearMask`` / legacy behaviour).
 
         :type mov_mask: array_like (Ni..., Nj...), optional
         :param mov_mask:
-            Optional mask for the moving image. Non-zero/positive values are
-            included. If None, the full image is used (legacy behaviour).
+            Optional mask for the moving image (TurboReg stack slice 2).
+            Non-zero values are included. If None, the full frame is used.
+
+        Masking follows ImageJ TurboReg:
+
+        * SSD only uses pixels where both masks are jointly non-zero under the
+          warp (``outMsk * inMsk``).
+        * Data outside the image frame is irrelevant. When masks mark
+          irrelevant regions (e.g. OOB pad), both images are cropped to the
+          bounding box of the mask intersection before registration — the same
+          idea as TurboReg mosaic crop ROIs — then the transform is lifted back
+          to full-image coordinates. Masks are still passed into TurboReg for
+          any non-rectangular exclusions inside that frame.
 
         :rtype:  ndarray(3,3)
         :return: 2D transformation matrix
@@ -111,7 +123,11 @@ class StackReg:
         ref_mask = self._validate_mask(ref_mask, ref.shape, "ref_mask")
         mov_mask = self._validate_mask(mov_mask, mov.shape, "mov_mask")
 
-        # TurboReg crops the last row/column; keep masks aligned with that crop.
+        ref, mov, ref_mask, mov_mask, origin_xy = self._crop_to_mask_frame(
+            ref, mov, ref_mask, mov_mask
+        )
+
+        # TurboReg/StackReg convention: drop last row/column; keep masks aligned.
         self._m, self._refpts, self._movpts = turboreg._register(
             ref[:-1, :-1],
             mov[:-1, :-1],
@@ -119,6 +135,14 @@ class StackReg:
             None if mov_mask is None else mov_mask[:-1, :-1],
             self._transformation,
         )
+
+        if origin_xy[0] != 0 or origin_xy[1] != 0:
+            mat = self._matrix_short_to_long(self._m)
+            mat = self._lift_matrix_from_crop(mat, origin_xy)
+            self._m = self._matrix_long_to_short(mat)
+            origin = np.asarray(origin_xy, dtype=np.double).reshape(1, 2)
+            self._refpts = np.asarray(self._refpts, dtype=np.double) + origin
+            self._movpts = np.asarray(self._movpts, dtype=np.double) + origin
 
         return self.get_matrix()
 
@@ -132,6 +156,84 @@ class StackReg:
                 "{} must have shape {}, got {}".format(name, shape, mask.shape)
             )
         return mask
+
+    @staticmethod
+    def _crop_to_mask_frame(ref, mov, ref_mask, mov_mask):
+        """
+        Crop to the bounding box of the TurboReg mask intersection.
+
+        Matches ImageJ TurboReg's convention that data outside the image frame
+        is irrelevant: masks that zero out OOB/pad borders shrink the frame
+        (as mosaic crop ROIs do) instead of leaving artificial edges inside
+        the pyramid/gradient images.
+        """
+        if ref_mask is None and mov_mask is None:
+            return ref, mov, None, None, (0, 0)
+
+        include = np.ones(ref.shape, dtype=bool)
+        if ref_mask is not None:
+            include &= ref_mask != 0
+        if mov_mask is not None:
+            include &= mov_mask != 0
+
+        if not np.any(include):
+            raise ValueError(
+                "Mask intersection is empty: no pixels are jointly non-zero "
+                "in ref_mask and mov_mask"
+            )
+
+        rows = np.any(include, axis=1)
+        cols = np.any(include, axis=0)
+        y0, y1 = int(np.argmax(rows)), int(len(rows) - np.argmax(rows[::-1]))
+        x0, x1 = int(np.argmax(cols)), int(len(cols) - np.argmax(cols[::-1]))
+
+        # Need room for the legacy [:-1, :-1] crop and TurboReg pyramids.
+        if (y1 - y0) < 4 or (x1 - x0) < 4:
+            raise ValueError(
+                "Mask intersection bounding box is too small for TurboReg "
+                "(got {}x{}, need at least 4x4)".format(y1 - y0, x1 - x0)
+            )
+
+        if y0 == 0 and x0 == 0 and y1 == ref.shape[0] and x1 == ref.shape[1]:
+            return ref, mov, ref_mask, mov_mask, (0, 0)
+
+        ref_c = ref[y0:y1, x0:x1]
+        mov_c = mov[y0:y1, x0:x1]
+        ref_m_c = None if ref_mask is None else ref_mask[y0:y1, x0:x1]
+        mov_m_c = None if mov_mask is None else mov_mask[y0:y1, x0:x1]
+        # origin_xy is (x, y) = (col, row), matching TurboReg point order
+        return ref_c, mov_c, ref_m_c, mov_m_c, (x0, y0)
+
+    def _lift_matrix_from_crop(self, mat, origin_xy):
+        """
+        Map a transform estimated in crop coordinates back to full-image
+        coordinates: ``p_full' = T_crop (p_full - o) + o``.
+        """
+        x0, y0 = float(origin_xy[0]), float(origin_xy[1])
+        if x0 == 0.0 and y0 == 0.0:
+            return mat
+
+        mat = np.array(mat, dtype=np.double, copy=True)
+        if self._transformation == self.BILINEAR:
+            # x' = a11 x + a12 y + a13 x y + tx  (crop coords), then + origin
+            a11, a12, a13, tx = mat[0, 0], mat[0, 1], mat[0, 2], mat[0, 3]
+            a21, a22, a23, ty = mat[1, 0], mat[1, 1], mat[1, 2], mat[1, 3]
+            mat[0, 0] = a11 - a13 * y0
+            mat[0, 1] = a12 - a13 * x0
+            mat[0, 2] = a13
+            mat[0, 3] = tx - a11 * x0 - a12 * y0 + a13 * x0 * y0 + x0
+            mat[1, 0] = a21 - a23 * y0
+            mat[1, 1] = a22 - a23 * x0
+            mat[1, 2] = a23
+            mat[1, 3] = ty - a21 * x0 - a22 * y0 + a23 * x0 * y0 + y0
+            return mat
+
+        # Affine family (including pure translation): A' = A, t' = t - A o + o
+        A = mat[0:2, 0:2]
+        t = mat[0:2, 2]
+        o = np.array([x0, y0], dtype=np.double)
+        mat[0:2, 2] = t - A.dot(o) + o
+        return mat
 
     def transform(self, mov, tmat=None):
         """
@@ -353,7 +455,7 @@ class StackReg:
 
         :type mask: array_like, optional
         :param mask:
-            Optional registration mask. May be:
+            Optional registration mask (TurboReg slice-2 convention). May be:
 
             * ``None``: no masking (legacy behaviour)
             * 2D array matching a single frame: same mask for every frame
@@ -361,6 +463,9 @@ class StackReg:
               ``reference='previous'``, frame ``i-1`` masks the reference and
               frame ``i`` masks the moving image. For ``'first'`` / ``'mean'``,
               the reference mask is the mean of the corresponding frames.
+
+            Each pair is handled by :meth:`register` (mask AND + crop to the
+            intersection bounding box, ImageJ TurboReg frame convention).
 
         :rtype:  ndarray(img.shape[axis], 3, 3)
         :return: The transformation matrix for each image in the stack
