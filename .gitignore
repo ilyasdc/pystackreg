@@ -20,3 +20,5 @@ MANIFEST
 .coverage/
 .mypy_cache/
 notebooks/
+.venv/
+.pytest_cache/

@@ -54,8 +54,14 @@ if __name__ == "__main__":
                 include_dirs=["inc/", get_numpy_include()],
             )
         ],
+        package_data={"pystackreg": ["*.cu"]},
+        include_package_data=True,
         setup_requires=["numpy"],
         install_requires=["numpy", "tqdm"],
+        extras_require={
+            "cuda": ["cupy-cuda12x"],
+            "test": ["pytest", "scikit-image", "scipy", "tifffile"],
+        },
         classifiers=[
             # complete list: http://pypi.python.org/pypi?%3Aaction=list_classifiers
             "Development Status :: 5 - Production/Stable",

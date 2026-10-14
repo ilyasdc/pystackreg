@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
+import concurrent.futures
+import warnings
 from . import turboreg  # type: ignore
 import numpy as np
 from tqdm import tqdm
-import warnings
 from .util import simple_slice, running_mean
+from .cuda import is_cuda_available, transform_cuda, transform_stack_cuda
 
 
 class StackReg:
@@ -47,20 +49,44 @@ class StackReg:
 
     _is_registered = False
 
-    def __init__(self, transformation):
+    def __init__(self, transformation, device="auto"):
         """
         Constructor
         :param transformation: TRANSLATION, RIGID_BODY, SCALED_ROTATION, AFFINE,
                                BILINEAR
+        :param device: 'auto' (use CUDA if available, else CPU), 'cuda', or 'cpu'
         """
         if transformation not in self._valid_transformations:
             raise Exception("Invalid transformation")
+
+        device_lower = str(device).lower()
+        if device_lower not in ("auto", "cuda", "cpu"):
+            raise ValueError(
+                f"Invalid device: '{device}'. Expected 'auto', 'cuda', or 'cpu'."
+            )
+
+        if device_lower == "auto":
+            self._device = "cuda" if is_cuda_available() else "cpu"
+        elif device_lower == "cuda":
+            if not is_cuda_available():
+                raise RuntimeError(
+                    "CUDA requested but no CUDA device or CuPy installation found."
+                )
+            self._device = "cuda"
+        else:
+            self._device = "cpu"
 
         self._transformation = transformation
         self._m = None
         self._tmats = None
         self._refpts = None
         self._movpts = None
+
+    @property
+    def device(self):
+        """Current execution device ('cuda' or 'cpu')."""
+        return self._device
+
 
     def is_registered(self):
         """
@@ -112,14 +138,16 @@ class StackReg:
         """
         self._is_registered = True
 
-        ref = np.asarray(ref, dtype=np.double)
-        mov = np.asarray(mov, dtype=np.double)
+        ref = self._to_numpy_double(ref)
+        mov = self._to_numpy_double(mov)
         if ref.shape != mov.shape:
             raise ValueError(
                 "Reference and moving images must have the same shape, got "
                 "{} and {}".format(ref.shape, mov.shape)
             )
 
+        ref_mask = self._to_numpy_double(ref_mask)
+        mov_mask = self._to_numpy_double(mov_mask)
         ref_mask = self._validate_mask(ref_mask, ref.shape, "ref_mask")
         mov_mask = self._validate_mask(mov_mask, mov.shape, "mov_mask")
 
@@ -145,6 +173,16 @@ class StackReg:
             self._movpts = np.asarray(self._movpts, dtype=np.double) + origin
 
         return self.get_matrix()
+
+    @staticmethod
+    def _to_numpy_double(arr):
+        if arr is None:
+            return None
+        if hasattr(arr, "cpu"):
+            arr = arr.cpu().numpy()
+        elif hasattr(arr, "get"):
+            arr = arr.get()
+        return np.asarray(arr, dtype=np.double)
 
     @staticmethod
     def _validate_mask(mask, shape, name):
@@ -260,6 +298,16 @@ class StackReg:
         else:
             tmat = self._m
 
+        is_gpu_arr = hasattr(mov, "__cuda_array_interface__") or (
+            hasattr(mov, "is_cuda") and mov.is_cuda
+        )
+        if (self._device == "cuda" or is_gpu_arr) and is_cuda_available():
+            return transform_cuda(mov, tmat)
+
+        if hasattr(mov, "cpu"):
+            mov = mov.cpu().numpy()
+        elif hasattr(mov, "get"):
+            mov = mov.get()
         return turboreg._transform(mov, tmat)
 
     def register_transform(self, ref, mov, ref_mask=None, mov_mask=None):
@@ -404,6 +452,7 @@ class StackReg:
         progress_callback=None,
         suppress_axis_warning=False,
         mask=None,
+        n_workers=None,
     ):
         """
         Register a stack of images (movie).
@@ -447,7 +496,7 @@ class StackReg:
             A function that is called after every iteration. This function should accept
             the keyword arguments current_iteration:int and end_iteration:int.
 
-        :type suppress_axis_warning: function, optional
+        :type suppress_axis_warning: bool, optional
         :param suppress_axis_warning:
             pystackreg will automatically try to determine the time axis and raise a
             warning when the detected time axis is not equal to the supplied axis.
@@ -467,6 +516,11 @@ class StackReg:
             Each pair is handled by :meth:`register` (mask AND + crop to the
             intersection bounding box, ImageJ TurboReg frame convention).
 
+        :type n_workers: int, optional
+        :param n_workers:
+            Number of worker threads for parallel pairwise registration.
+            Default (None) uses min(32, frames). Set to 1 for sequential execution.
+
         :rtype:  ndarray(img.shape[axis], 3, 3)
         :return: The transformation matrix for each image in the stack
         """
@@ -481,6 +535,10 @@ class StackReg:
 
         if len(img.shape) != 3:
             raise Exception("Stack must have three dimensions")
+
+        img = self._to_numpy_double(img)
+        if mask is not None:
+            mask = self._to_numpy_double(mask)
 
         if not suppress_axis_warning:
             lowest_var_axis = self._detect_time_axis(img)
@@ -555,44 +613,93 @@ class StackReg:
         else:
             raise ValueError('Unknown reference "{}"'.format(reference))
 
-        iterable = range(idx_start, img.shape[axis])
+        iterable = list(range(idx_start, img.shape[axis]))
+        total_steps = len(iterable)
 
-        if verbose:
-            iterable = tqdm(iterable)
-
-        for i in iterable:
-            slc = [slice(None)] * len(img.shape)
-            slc[axis] = i
-
+        # Helper to compute pairwise registration for frame i
+        def _register_frame(i):
             if reference == "previous":
-                ref = img.take(i - 1, axis=axis)
-                if mask_stack is not None:
-                    ref_mask = simple_slice(mask_stack, i - 1, axis)
-                else:
-                    ref_mask = static_mask
-
-            if mask_stack is not None:
-                mov_mask = simple_slice(mask_stack, i, axis)
+                frame_ref = img.take(i - 1, axis=axis)
+                frame_ref_mask = (
+                    simple_slice(mask_stack, i - 1, axis)
+                    if mask_stack is not None
+                    else static_mask
+                )
             else:
-                mov_mask = static_mask
+                frame_ref = ref
+                frame_ref_mask = ref_mask
 
-            self._tmats[i, :, :] = self.register(
-                ref,
-                simple_slice(img, i, axis),
-                ref_mask=ref_mask,
-                mov_mask=mov_mask,
+            frame_mov = simple_slice(img, i, axis)
+            frame_mov_mask = (
+                simple_slice(mask_stack, i, axis)
+                if mask_stack is not None
+                else static_mask
             )
 
-            if reference == "previous" and i > 0:
-                self._tmats[i, :, :] = np.matmul(
-                    self._tmats[i, :, :], self._tmats[i - 1, :, :]
-                )
+            # Thread-local StackReg instance for concurrency safety
+            local_sr = StackReg(self._transformation, device=self._device)
+            m = local_sr.register(
+                frame_ref,
+                frame_mov,
+                ref_mask=frame_ref_mask,
+                mov_mask=frame_mov_mask,
+            )
+            return i, m, local_sr._m, local_sr._refpts, local_sr._movpts
 
-            if progress_callback is not None:
-                progress_callback(
-                    current_iteration=i - idx_start + 1,
-                    end_iteration=img.shape[axis] - idx_start,
-                )
+        step_tmats = [None] * img.shape[axis]
+        last_pts = None
+
+        use_parallel = (n_workers is None or n_workers > 1) and len(iterable) > 1
+
+        if use_parallel:
+            completed = 0
+            pbar = tqdm(total=total_steps) if verbose else None
+            max_w = n_workers if n_workers is not None else min(32, len(iterable))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+                futures = {executor.submit(_register_frame, i): i for i in iterable}
+                for fut in concurrent.futures.as_completed(futures):
+                    i, mat, short_m, refpts, movpts = fut.result()
+                    step_tmats[i] = mat
+                    if i == iterable[-1]:
+                        last_pts = (short_m, refpts, movpts)
+                    completed += 1
+                    if pbar is not None:
+                        pbar.update(1)
+                    if progress_callback is not None:
+                        progress_callback(
+                            current_iteration=completed,
+                            end_iteration=total_steps,
+                        )
+            if pbar is not None:
+                pbar.close()
+        else:
+            pbar = tqdm(iterable) if verbose else iterable
+            completed = 0
+            for i in pbar:
+                _, mat, short_m, refpts, movpts = _register_frame(i)
+                step_tmats[i] = mat
+                last_pts = (short_m, refpts, movpts)
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        current_iteration=completed,
+                        end_iteration=total_steps,
+                    )
+
+        if last_pts is not None:
+            self._m, self._refpts, self._movpts = last_pts
+            self._is_registered = True
+
+        for i in iterable:
+            if reference == "previous":
+                if i == 0:
+                    self._tmats[i, :, :] = step_tmats[i]
+                else:
+                    self._tmats[i, :, :] = np.matmul(
+                        step_tmats[i], self._tmats[i - 1, :, :]
+                    )
+            else:
+                self._tmats[i, :, :] = step_tmats[i]
 
         return self._tmats
 
@@ -625,6 +732,15 @@ class StackReg:
                 "Number of saved transformation matrices does not match stack length"
             )
 
+        is_gpu_arr = hasattr(img, "__cuda_array_interface__") or (
+            hasattr(img, "is_cuda") and img.is_cuda
+        )
+        if (self._device == "cuda" or is_gpu_arr) and is_cuda_available():
+            short_tmats = [
+                self._matrix_long_to_short(tmats[i]) for i in range(tmats.shape[0])
+            ]
+            return transform_stack_cuda(img, short_tmats, axis=axis)
+
         out = img.copy().astype(float)
 
         for i in range(img.shape[axis]):
@@ -644,6 +760,7 @@ class StackReg:
         verbose=False,
         progress_callback=None,
         mask=None,
+        n_workers=None,
     ):
         """
         Register and transform stack of images (movie).
@@ -686,6 +803,11 @@ class StackReg:
         :type mask: array_like, optional
         :param mask: Optional 2D or 3D registration mask (see register_stack)
 
+        :type n_workers: int, optional
+        :param n_workers:
+            Number of worker threads for parallel pairwise registration.
+            Default (None) uses min(32, frames). Set to 1 for sequential execution.
+
         :rtype:  ndarray(Ni..., Nj..., Nk...)
         :return: The transformed stack
         """
@@ -698,6 +820,18 @@ class StackReg:
             verbose=verbose,
             progress_callback=progress_callback,
             mask=mask,
+            n_workers=n_workers,
         )
 
         return self.transform_stack(img, axis)
+
+
+class StackRegCUDA(StackReg):
+    """
+    CUDA-accelerated implementation of StackReg.
+    Defaults to device='cuda'.
+    """
+
+    def __init__(self, transformation, device="cuda"):
+        super().__init__(transformation, device=device)
+
